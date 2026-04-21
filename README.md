@@ -1,10 +1,10 @@
 **Project Title**
 
-[Enter your project name here]
+Gotta Code Em All
 
 **📌 Project Overview**
 
-[Provide a short description of your project]
+[Provide a short description of your project
 
 
 **📂 Repository Structure**
@@ -28,4 +28,5 @@ Media → Weekly progress and final output
 
 
 **👥 Team Members**
-[Name]
+Tanay Dhavate
+Sachit Patnaik

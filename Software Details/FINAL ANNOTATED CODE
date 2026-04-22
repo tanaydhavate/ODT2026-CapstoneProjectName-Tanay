@@ -1,0 +1,872 @@
+import gc          # garbage collector — frees unused memory
+import os          # file system access — needed to mount the SD card
+import sdcard      # SD card driver library
+import framebuf    # frame buffer — lets us draw pixels and bitmaps on the OLED
+import urandom     # random number generator — used for the catch roll
+
+from time import sleep_ms, sleep, ticks_ms, ticks_diff
+# sleep_ms / sleep  → pause execution for a set time
+# ticks_ms / ticks_diff → non-blocking timing (like a stopwatch) so we don't freeze the system
+
+from machine import Pin, SPI, I2C, I2S, ADC, reset
+# Pin   → controls GPIO pins (buttons, motor, LEDs)
+# SPI   → communication protocol for the SD card
+# I2C   → communication protocol for the OLED screen
+# I2S   → audio protocol for the amplifier and speaker
+# ADC   → reads analog voltage from the resistor in each figure
+# reset → reboots the ESP32
+
+from neopixel import NeoPixel   # NeoPixel LED driver
+from SH1106 import SH1106_I2C   # OLED display driver
+
+gc.collect()  # free memory before anything starts — good practice on a microcontroller
+
+# ─── Pin Assignments ──────────────────────────────────────────────────────────
+# These numbers refer to physical GPIO pins on the ESP32 board.
+# Each peripheral needs specific pins — we mapped these carefully to avoid conflicts
+# between SPI (SD card), I2C (OLED), I2S (audio), and GPIO (everything else).
+
+SD_CS_PIN    = 5    # SD card chip select
+SD_SCK_PIN   = 18   # SD card clock
+SD_MOSI_PIN  = 23   # SD card data out (ESP32 → SD)
+SD_MISO_PIN  = 19   # SD card data in  (SD → ESP32)
+
+RANGEELA_PIN = 4    # NeoPixel LED data pin
+# Renamed "rangeela" (रंगीला — colourful in Hindi) — fits the LED ring perfectly
+NUM_LEDS     = 16   # 16 LEDs in the ring
+
+OLED_SCL_PIN = 22   # OLED clock line (I2C)
+OLED_SDA_PIN = 21   # OLED data line  (I2C)
+OLED_ADDR    = 0x3C # I2C address of the OLED — fixed by hardware
+OLED_W       = 128  # OLED width in pixels
+OLED_H       = 64   # OLED height in pixels
+
+I2S_SCK_PIN  = 26   # audio bit clock
+I2S_WS_PIN   = 25   # audio word select (left/right channel)
+I2S_SD_PIN   = 27   # audio data out to amplifier
+
+ADC_PIN      = 33   # reads the resistor voltage from the plugged-in figure
+# Pin 33 chosen after testing — most stable ADC reading, no boot mode conflicts
+
+POOPER_PIN = 34     # BOOT button — wakes the device and triggers reboot
+BUTTER_PIN = 35     # SCAN button — initiates scan and throw
+# Pins 34 and 35 are input-only with no internal pull-up resistors on the ESP32.
+# We added external pull-up resistors to make them work reliably as buttons.
+# Renamed "pooper" and "butter" as team nicknames for boot and scan respectively.
+
+MOTOR_ENA_PIN = 15  # motor enable (speed control)
+MOTOR_IN1_PIN = 13  # motor direction pin 1
+MOTOR_IN2_PIN = 14  # motor direction pin 2
+
+# ─── Timing & Audio Constants ─────────────────────────────────────────────────
+FRAME_WIDTH    = 128   # OLED width — matches display resolution
+FRAME_HEIGHT   = 64    # OLED height — matches display resolution
+FRAME_SIZE     = 1024  # bytes per frame (128 × 64 ÷ 8 = 1024 in MONO_HLSB format)
+AUDIO_RATE     = 8000  # audio sample rate in Hz — low enough to fit files on SD card
+AUDIO_BUF_SIZE = 8192  # I2S internal buffer — large enough to prevent audio glitches
+MONO_BUF_SIZE  = 512   # how many bytes we read and send to the amp at a time
+# 512 bytes was the sweet spot — smaller caused stuttering, larger caused lag
+
+LONG_PRESS_MS  = 2000  # hold POOPER for 2s to reboot — long enough to avoid accidents
+CATCH_PRESS_MS = 5000  # hold BUTTER for 5s to throw the Pokéball
+ADC_SAMPLES    = 20    # number of ADC readings to average — reduces noise from the resistor circuit
+
+SHAKE_ON_MS  = 120  # how long motor runs per direction during a shake (120ms)
+SHAKE_GAP_MS = 90   # pause between forward and backward motor pulse
+
+SHAKE_LABELS = ["Shake 1!", "Shake 2!", "Shake 3!"]  # text shown on OLED during each shake
+
+# ─── Rarity Table ─────────────────────────────────────────────────────────────
+# Each Pokémon has a rarity tier and a catch chance out of 20.
+# Common = 15/20 (75%), Uncommon = 10/20 (50%), Rare = 2/20 (10%), Ultra Rare = 1/20 (5%)
+# These numbers were chosen to make catching feel rewarding but not guaranteed.
+RARITY = {
+    "jigglypuff": ("Common",     15),
+    "spheal":     ("Common",     15),
+    "pikachu":    ("Common",     15),
+    "mudkip":     ("Uncommon",   10),
+    "snivy":      ("Uncommon",   10),
+    "umbreon":    ("Rare",        2),
+    "raichu":     ("Rare",        2),
+    "vaporeon":   ("Rare",        2),
+    "gengar":     ("Rare",        2),
+    "mew":        ("Ultra Rare",  1),
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HARDWARE INITIALISATION
+# Each peripheral is initialised separately with deliberate delays between them.
+# Reason: booting everything at once caused frequent crashes during testing —
+# the ESP32 couldn't handle simultaneous SPI, I2C, and I2S setup reliably.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def init_sd():
+    # Sets up SPI communication with the SD card and mounts it as a file system.
+    # The CS pin is pulled HIGH first — this deselects the card before initialising,
+    # which prevents the SD card from misreading the initial clock pulses.
+    cs = Pin(SD_CS_PIN, Pin.OUT)
+    cs.value(1)
+    sleep_ms(300)  # wait for SD card to stabilise before sending any clock signal
+    spi = SPI(1, baudrate=100000, polarity=0, phase=0,
+              sck=Pin(SD_SCK_PIN), mosi=Pin(SD_MOSI_PIN), miso=Pin(SD_MISO_PIN))
+    sleep_ms(200)  # additional settle time before mounting
+    sd = sdcard.SDCard(spi, cs)
+    os.mount(sd, "/sd")  # all files accessed as /sd/filename
+    print("SD OK")
+    return spi, sd
+
+def init_neopixel():
+    # Sets up the 16-LED NeoPixel ring (rangeela).
+    # Starts with all LEDs off — avoids random colours on boot.
+    pin = Pin(RANGEELA_PIN, Pin.OUT, value=0)
+    rangeela = NeoPixel(pin, NUM_LEDS)
+    rangeela.fill((0, 0, 0))
+    rangeela.write()
+    sleep_ms(50)
+    return rangeela
+
+def init_oled():
+    # Sets up the 128×64 OLED display over I2C.
+    # Fills black and shows immediately — clears any leftover display artifacts from boot.
+    i2c = I2C(0, scl=Pin(OLED_SCL_PIN), sda=Pin(OLED_SDA_PIN))
+    oled = SH1106_I2C(OLED_W, OLED_H, i2c, addr=OLED_ADDR)
+    oled.fill(0)
+    oled.show()
+    return i2c, oled
+
+def init_audio():
+    # Initialises the I2S audio interface for the MAX98357A amplifier.
+    # Mode TX = transmit only (we only send audio, never receive).
+    # 16-bit MONO at 8000Hz — low sample rate keeps WAV file sizes small enough for the SD card.
+    # Note: a 75Ω resistor between GPIO 27 and the amp's data pin was needed to eliminate distortion.
+    return I2S(0, sck=Pin(I2S_SCK_PIN), ws=Pin(I2S_WS_PIN), sd=Pin(I2S_SD_PIN),
+               mode=I2S.TX, bits=16, format=I2S.MONO,
+               rate=AUDIO_RATE, ibuf=AUDIO_BUF_SIZE)
+
+def init_adc():
+    # Sets up the ADC on pin 33 to read the resistor voltage from plugged-in figures.
+    # ATTN_11DB extends the readable voltage range to 0–3.6V — needed to cover all 10 resistor values.
+    adc = ADC(Pin(ADC_PIN))
+    adc.atten(ADC.ATTN_11DB)
+    return adc
+
+def init_buttons():
+    # Sets up POOPER (boot) and BUTTER (scan) as input pins.
+    # Pins 34 and 35 are input-only — no internal pull-ups available on these pins.
+    # External pull-up resistors were added to the circuit to make them work correctly.
+    pooper = Pin(POOPER_PIN, Pin.IN)
+    butter = Pin(BUTTER_PIN, Pin.IN)
+    return pooper, butter
+
+def init_motor():
+    # Sets up the L298N motor driver for the Pokéball shake mechanism.
+    # All pins start LOW (motor off) — prevents the motor from spinning on boot.
+    ena = Pin(MOTOR_ENA_PIN, Pin.OUT, value=0)
+    in1 = Pin(MOTOR_IN1_PIN, Pin.OUT, value=0)
+    in2 = Pin(MOTOR_IN2_PIN, Pin.OUT, value=0)
+    return ena, in1, in2
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SHARED UTILITIES
+# Small helper functions used throughout the program.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def rangeela_clear(rangeela):
+    # Turns all LEDs off. Called whenever a phase ends or the system resets.
+    rangeela.fill((0, 0, 0))
+    rangeela.write()
+
+def rangeela_all(rangeela, color):
+    # Sets all 16 LEDs to a single colour at once — used for result floods (green/red).
+    rangeela.fill(color)
+    rangeela.write()
+
+def oled_message(oled, line1, line2="", line3=""):
+    # Clears the screen and prints up to 3 lines of centered text.
+    # Used for all status messages: "Booting...", "Scanning...", "Ready to Scan", etc.
+    oled.fill(0)
+    oled.invert(False)
+    if line1: oled.text(line1, max(0, (128 - len(line1) * 8) // 2), 16)
+    if line2: oled.text(line2, max(0, (128 - len(line2) * 8) // 2), 30)
+    if line3: oled.text(line3, max(0, (128 - len(line3) * 8) // 2), 44)
+    oled.show()
+
+def load_frames(path):
+    # Reads binary animation frames from the SD card into RAM.
+    # Each frame is exactly 1024 bytes (128×64 pixels, 1 bit per pixel).
+    # We cap at 30 frames — enough for a smooth animation without exhausting RAM.
+    frames = []
+    with open(path, "rb") as f:
+        while len(frames) < 30:
+            data = f.read(FRAME_SIZE)
+            if len(data) < FRAME_SIZE:
+                break
+            frames.append(bytearray(data))
+    return frames
+
+def open_wav(path):
+    # Opens a WAV file and seeks past the header to the raw audio data.
+    # WAV files start with a 44-byte header followed by the actual sound data.
+    # We check for the "data" chunk marker — some WAV files have extra metadata chunks
+    # before the audio, so we scan through until we find the real audio start.
+    f = open(path, "rb")
+    f.seek(0)
+    header = f.read(44)
+    if header[36:40] != b'data':
+        while True:
+            chunk = f.read(8)
+            if not chunk or len(chunk) < 8:
+                break
+            if chunk[:4] == b'data':
+                break
+            size = chunk[4] | (chunk[5] << 8) | (chunk[6] << 16) | (chunk[7] << 24)
+            f.seek(size, 1)
+    return f
+
+def play_wav_simple(path):
+    # Plays a WAV file straight through with no animation.
+    # Used for simple sounds (boot chime, etc.).
+    # The finally block ensures the I2S interface is always deinitialised even if playback fails —
+    # leaving I2S open causes crashes on the next audio call.
+    audio = None
+    wav   = None
+    try:
+        audio    = init_audio()
+        mono_buf = bytearray(MONO_BUF_SIZE)
+        wav      = open_wav(path)
+        while True:
+            num = wav.readinto(mono_buf)
+            if num == 0:
+                break
+            if num < MONO_BUF_SIZE:
+                for i in range(num, MONO_BUF_SIZE):
+                    mono_buf[i] = 0  # zero-pad the last partial chunk to avoid noise
+            audio.write(mono_buf)
+    finally:
+        if wav:   wav.close()
+        if audio: audio.deinit()  # always release I2S after use
+
+def play_audio_with_animation(oled, frames, wav_path, draw_fn):
+    # The core reveal engine — plays audio and animates the OLED sprite in sync.
+    # Audio drives the timing: we write 512 bytes to the amp each loop iteration.
+    # Every 6th iteration we advance one animation frame — this ratio was tuned
+    # so the animation runs at a natural speed relative to the audio length.
+    # No separate timer needed — the audio write speed IS the clock.
+    audio = None
+    wav   = None
+    try:
+        audio    = init_audio()
+        mono_buf = bytearray(MONO_BUF_SIZE)
+        wav      = open_wav(wav_path)
+        frame_i    = 0
+        loop_count = 0
+        while True:
+            num = wav.readinto(mono_buf)
+            if num == 0:
+                break
+            if num < MONO_BUF_SIZE:
+                for i in range(num, MONO_BUF_SIZE):
+                    mono_buf[i] = 0
+            audio.write(mono_buf)
+            if loop_count % 6 == 0:  # advance frame every 6 audio chunks
+                draw_fn(oled, frames[frame_i % len(frames)])  # loop frames if audio outlasts animation
+                frame_i += 1
+            loop_count += 1
+    finally:
+        if wav:   wav.close()
+        if audio: audio.deinit()
+
+def read_adc_average(adc):
+    # Takes 20 ADC readings with 25ms gaps and returns the average.
+    # A single raw read is too noisy — the ESP32 ADC has known instability,
+    # especially near the edges of its voltage range. Averaging 20 samples
+    # gives a consistent, reliable value for identification.
+    total = 0
+    for _ in range(ADC_SAMPLES):
+        total += adc.read()
+        sleep_ms(25)
+    return total // ADC_SAMPLES
+
+def check_long_press(btn, duration_ms):
+    # Returns True if the button is held for longer than duration_ms.
+    # Used for the 2-second POOPER hold → reboot. The while loop keeps checking
+    # without blocking other logic — if the button is released early, returns False.
+    if btn.value() == 0:
+        t = ticks_ms()
+        while btn.value() == 0:
+            if ticks_diff(ticks_ms(), t) >= duration_ms:
+                return True
+            sleep_ms(50)
+    return False
+
+def wait_for_button_release(btn):
+    # Waits until the button is no longer pressed before continuing.
+    # Prevents a single press from registering multiple times.
+    while btn.value() == 0:
+        sleep_ms(20)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MOTOR UTILITIES
+# Controls the DC motor inside the Pokéball via the L298N driver.
+# forward/backward spin in opposite directions — together they create the shake.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def motor_stop(ena, in1, in2):
+    ena.value(0); in1.value(0); in2.value(0)
+
+def motor_forward(ena, in1, in2):
+    in1.value(1); in2.value(0); ena.value(1)
+
+def motor_backward(ena, in1, in2):
+    in1.value(0); in2.value(1); ena.value(1)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BOOT & SCAN ANIMATIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Alternating gold/green/red colours repeated across 16 LEDs — Pokédex themed.
+BOOT_COLORS = [(150, 120, 0), (0, 150, 0), (150, 0, 0)] * 6
+
+def boot_animation(oled, rangeela):
+    # Shows "POKEDEX / Booting..." on screen while LEDs chase on then fade off.
+    # This signals to the user that the device is alive and initialising.
+    oled_message(oled, "POKEDEX", "Booting...")
+    rangeela_clear(rangeela)
+    for i in range(NUM_LEDS):
+        rangeela[i] = BOOT_COLORS[i]
+        rangeela.write()
+        sleep_ms(80)   # slow chase on
+    sleep_ms(600)      # hold the full display briefly for effect
+    for i in range(NUM_LEDS - 1, -1, -1):
+        rangeela[i] = (0, 0, 0)
+        rangeela.write()
+        sleep_ms(40)   # faster fade off
+    rangeela_clear(rangeela)
+
+def scan_animation(rangeela):
+    # Green LEDs sweep around the ring to show the device is scanning.
+    # Visual feedback so the user knows the ADC read is happening.
+    rangeela_clear(rangeela)
+    for i in range(NUM_LEDS):
+        rangeela[i] = (0, 80, 0)
+        rangeela.write()
+        sleep_ms(50)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CATCHING MECHANIC
+# ══════════════════════════════════════════════════════════════════════════════
+
+def show_result_screen(oled, pokemon_key, pokemon_name, caught):
+    # Displays the Pokémon sprite on the left half of the OLED with the result on the right.
+    # Falls back to plain text if the binary frame file is missing or corrupted.
+    try:
+        frames = load_frames("/sd/" + pokemon_key + ".bin")
+        if frames:
+            fb = framebuf.FrameBuffer(frames[0], FRAME_WIDTH, FRAME_HEIGHT, framebuf.MONO_HLSB)
+            oled.fill(0)
+            oled.invert(False)
+            oled.blit(fb, 0, 0)          # draw sprite on left half
+            oled.fill_rect(64, 0, 64, 64, 0)  # clear right half for text overlay
+            oled.text(pokemon_name[:7], 66, 10, 1)
+            if caught:
+                oled.text("Caught!!", 66, 28, 1)
+                oled.text(":)",       82, 46, 1)
+            else:
+                oled.text("Got away!", 66, 28, 1)
+                oled.text(":(",        82, 46, 1)
+            oled.show()
+        else:
+            oled_message(oled, pokemon_name, "Caught!!" if caught else "Got away!", ":)" if caught else ":(")
+    except:
+        oled_message(oled, pokemon_name, "Caught!!" if caught else "Got away!", ":)" if caught else ":(")
+
+def oled_hold_screen(oled, secs_left, warning=False):
+    # Shows the countdown timer during the catch hold.
+    # warning=True shows "Keep holding!" if the user released the button early.
+    oled.fill(0)
+    oled.invert(False)
+    title = "Keep holding!" if warning else "Hold SCAN"
+    oled.text(title,       max(0, (128 - len(title) * 8) // 2), 10)
+    oled.text("to throw!", max(0, (128 - len("to throw!") * 8) // 2), 24)
+    countdown_str = str(secs_left) + "s..."
+    oled.text(countdown_str, max(0, (128 - len(countdown_str) * 8) // 2), 42)
+    oled.show()
+
+def try_catch(oled, rangeela, butter, motor_ena, motor_in1, motor_in2, pokemon_key, pokemon_name):
+    rarity_name, catch_chance = RARITY.get(pokemon_key, ("Common", 15))
+
+    oled_message(oled, pokemon_name, rarity_name, "Hold SCAN 5s")
+    rangeela_clear(rangeela)
+    sleep_ms(1000)
+
+    t_start          = ticks_ms()
+    led_lit          = 0
+    last_secs        = -1
+    caught           = False
+    roll_done        = False
+
+    # Three shake events, each with its own phase tracker.
+    # phase 0 = waiting, 1 = forward, 2 = pause, 3 = backward, 4 = done
+    hold_shake_times = [1000, 2500, 4000]   # when each shake fires (ms into hold)
+    hold_shake_phase = [0, 0, 0]
+    hold_shake_t     = [0, 0, 0]
+
+    oled_hold_screen(oled, 5)
+
+    while True:
+        if butter.value() == 0:  # BUTTER is being held
+            elapsed        = ticks_diff(ticks_ms(), t_start)
+            secs_remaining = max(0, (CATCH_PRESS_MS - elapsed + 999) // 1000)
+
+            # Fill LEDs progressively as a power meter
+            new_led = min(NUM_LEDS, elapsed * NUM_LEDS // CATCH_PRESS_MS)
+            while led_lit < new_led:
+                rangeela[led_lit] = (150, 80, 0)
+                rangeela.write()
+                led_lit += 1
+
+            # Decide catch outcome early and silently — the shakes are just theatre
+            if led_lit >= 3 and not roll_done:
+                roll      = urandom.getrandbits(8) % 20
+                caught    = roll < catch_chance  # e.g. Common: need roll < 15 out of 20
+                roll_done = True
+                print("Roll:", roll, "/ Need <", catch_chance, "/ Caught:", caught)
+
+            # Non-blocking motor shake logic — all three shakes tracked independently
+            # Uses ticks_diff instead of sleep so LEDs and OLED keep updating simultaneously
+            shake_active = False
+            for idx in range(3):
+                phase = hold_shake_phase[idx]
+                if phase == 0 and elapsed >= hold_shake_times[idx]:
+                    motor_forward(motor_ena, motor_in1, motor_in2)
+                    hold_shake_t[idx] = elapsed
+                    hold_shake_phase[idx] = 1
+                    oled.fill(0); oled.invert(False)
+                    oled.text("Hold SCAN",  max(0,(128-9*8)//2), 10, 1)
+                    oled.text("to throw!",  max(0,(128-9*8)//2), 24, 1)
+                    oled.text(SHAKE_LABELS[idx], max(0,(128-len(SHAKE_LABELS[idx])*8)//2), 44, 1)
+                    oled.show()
+                elif phase == 1 and elapsed >= hold_shake_t[idx] + SHAKE_ON_MS:
+                    motor_stop(motor_ena, motor_in1, motor_in2)
+                    hold_shake_t[idx] = elapsed; hold_shake_phase[idx] = 2
+                elif phase == 2 and elapsed >= hold_shake_t[idx] + SHAKE_GAP_MS:
+                    motor_backward(motor_ena, motor_in1, motor_in2)
+                    hold_shake_t[idx] = elapsed; hold_shake_phase[idx] = 3
+                elif phase == 3 and elapsed >= hold_shake_t[idx] + SHAKE_ON_MS:
+                    motor_stop(motor_ena, motor_in1, motor_in2)
+                    hold_shake_phase[idx] = 4
+                if hold_shake_phase[idx] in (1, 2, 3):
+                    shake_active = True
+
+            if not shake_active and secs_remaining != last_secs:
+                oled_hold_screen(oled, secs_remaining)
+                last_secs = secs_remaining
+
+            if elapsed >= CATCH_PRESS_MS:
+                break  # 5 seconds complete — exit catch loop
+
+        else:
+            # BUTTER released early — reset everything and ask them to hold again
+            motor_stop(motor_ena, motor_in1, motor_in2)
+            rangeela_clear(rangeela)
+            led_lit = 0; t_start = ticks_ms(); last_secs = -1
+            caught = False; roll_done = False
+            hold_shake_phase = [0, 0, 0]; hold_shake_t = [0, 0, 0]
+            oled_hold_screen(oled, 5, warning=True)
+
+        sleep_ms(30)  # loop runs every 30ms — fast enough to feel responsive
+
+    motor_stop(motor_ena, motor_in1, motor_in2)
+    wait_for_button_release(butter)
+
+    rangeela_clear(rangeela)
+    oled_message(oled, "Pokeball", "thrown!", "")
+    sleep_ms(400)
+
+    # Play result audio and flash LEDs white 3 times for drama
+    wav_path = "/sd/caught.wav" if caught else "/sd/notcaught.wav"
+    audio = None; wav = None
+    try:
+        audio = init_audio()
+        mono_buf = bytearray(MONO_BUF_SIZE)
+        wav = open_wav(wav_path)
+        for _ in range(3):
+            rangeela_all(rangeela, (60, 60, 60))   # white flash
+            num = wav.readinto(mono_buf)
+            if num:
+                if num < MONO_BUF_SIZE:
+                    for i in range(num, MONO_BUF_SIZE): mono_buf[i] = 0
+                audio.write(mono_buf)
+            sleep_ms(200)
+            rangeela_clear(rangeela)               # flash off
+            num = wav.readinto(mono_buf)
+            if num:
+                if num < MONO_BUF_SIZE:
+                    for i in range(num, MONO_BUF_SIZE): mono_buf[i] = 0
+                audio.write(mono_buf)
+            sleep_ms(200)
+
+        # Final colour flood based on result
+        if caught:
+            rangeela_all(rangeela, (0, 120, 0))    # green = caught
+            show_result_screen(oled, pokemon_key, pokemon_name, True)
+        else:
+            rangeela_all(rangeela, (120, 0, 0))    # red = escaped
+            show_result_screen(oled, pokemon_key, pokemon_name, False)
+
+        # Drain remaining audio
+        while True:
+            num = wav.readinto(mono_buf)
+            if num == 0: break
+            if num < MONO_BUF_SIZE:
+                for i in range(num, MONO_BUF_SIZE): mono_buf[i] = 0
+            audio.write(mono_buf)
+    finally:
+        if wav: wav.close()
+        if audio: audio.deinit()  # always release I2S
+
+    sleep(2)
+    rangeela_clear(rangeela)
+    motor_stop(motor_ena, motor_in1, motor_in2)
+    return caught
+
+# ══════════════════════════════════════════════════════════════════════════════
+# POKÉMON FUNCTIONS
+# Each Pokémon has two functions:
+#   draw_frame → how to render one animation frame on the OLED (sprite + stats)
+#   play_*     → sets LED colour, loads frames, plays audio, returns the Pokémon key
+# Gengar is special — it uses an INVERTED screen (white background, dark sprite)
+# to match the ghostly aesthetic. All others use a standard dark background.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def snivy_draw_frame(oled, frame_bytes):
+    fb = framebuf.FrameBuffer(frame_bytes, FRAME_WIDTH, FRAME_HEIGHT, framebuf.MONO_HLSB)
+    oled.fill(0); oled.invert(False); oled.blit(fb, 0, 0)
+    oled.fill_rect(64, 0, 64, 64, 0)
+    oled.text("Snivy",      66,  0, 1)
+    oled.text("----------", 66,  9, 1)
+    oled.text("Grass",      66, 18, 1)
+    oled.text("----------", 66, 27, 1)
+    oled.text("Unova",      66, 36, 1)
+    oled.text("----------", 66, 45, 1)
+    oled.text("0.6m 8.1kg", 66, 55, 1)
+    oled.show()
+
+def play_snivy(oled, rangeela):
+    for i in range(8):           rangeela[i] = (0, 120, 0)   # grass green
+    for i in range(8, NUM_LEDS): rangeela[i] = (0, 60, 0)    # dimmer outer ring
+    rangeela.write()
+    frames = load_frames("/sd/snivy.bin")
+    if not frames: oled_message(oled, "Snivy", "No frames!"); sleep(2); return None, None
+    gc.collect()  # free memory before loading audio — prevents RAM overflow
+    play_audio_with_animation(oled, frames, "/sd/snivy.wav", snivy_draw_frame)
+    return "snivy", "Snivy"
+
+def vaporeon_draw_frame(oled, frame_bytes):
+    fb = framebuf.FrameBuffer(frame_bytes, FRAME_WIDTH, FRAME_HEIGHT, framebuf.MONO_HLSB)
+    oled.fill(0); oled.invert(False); oled.blit(fb, 0, 0)
+    oled.fill_rect(64, 0, 64, 64, 0)
+    oled.text("Vaporeon",   66,  0, 1)
+    oled.text("----------", 66,  9, 1)
+    oled.text("Water",      66, 18, 1)
+    oled.text("----------", 66, 27, 1)
+    oled.text("Kanto",      66, 36, 1)
+    oled.text("----------", 66, 45, 1)
+    oled.text("1.0m 29kg",  66, 55, 1)
+    oled.show()
+
+def play_vaporeon(oled, rangeela):
+    for i in range(8):           rangeela[i] = (0, 80, 150)   # ocean blue
+    for i in range(8, NUM_LEDS): rangeela[i] = (0, 40, 80)
+    rangeela.write()
+    frames = load_frames("/sd/vaporeon.bin")
+    if not frames: oled_message(oled, "Vaporeon", "No frames!"); sleep(2); return None, None
+    gc.collect()
+    play_audio_with_animation(oled, frames, "/sd/vaporeon.wav", vaporeon_draw_frame)
+    return "vaporeon", "Vaporeon"
+
+def raichu_draw_frame(oled, frame_bytes):
+    fb = framebuf.FrameBuffer(frame_bytes, FRAME_WIDTH, FRAME_HEIGHT, framebuf.MONO_HLSB)
+    oled.fill(0); oled.invert(False); oled.blit(fb, 0, 0)
+    oled.fill_rect(64, 0, 64, 64, 0)
+    oled.text("Raichu",     66,  0, 1)
+    oled.text("----------", 66,  9, 1)
+    oled.text("Electric",   66, 18, 1)
+    oled.text("----------", 66, 27, 1)
+    oled.text("Kanto",      66, 36, 1)
+    oled.text("----------", 66, 45, 1)
+    oled.text("0.8m 30kg",  66, 55, 1)
+    oled.show()
+
+def play_raichu(oled, rangeela):
+    for i in range(8):           rangeela[i] = (150, 100, 0)  # warm orange
+    for i in range(8, NUM_LEDS): rangeela[i] = (80, 50, 0)
+    rangeela.write()
+    frames = load_frames("/sd/raichu.bin")
+    if not frames: oled_message(oled, "Raichu", "No frames!"); sleep(2); return None, None
+    gc.collect()
+    play_audio_with_animation(oled, frames, "/sd/raichu.wav", raichu_draw_frame)
+    return "raichu", "Raichu"
+
+def umbreon_draw_frame(oled, frame_bytes):
+    fb = framebuf.FrameBuffer(frame_bytes, FRAME_WIDTH, FRAME_HEIGHT, framebuf.MONO_HLSB)
+    oled.fill(0); oled.invert(False); oled.blit(fb, 0, 0)
+    oled.fill_rect(64, 0, 64, 64, 0)
+    oled.text("Umbreon",    66,  0, 1)
+    oled.text("----------", 66,  9, 1)
+    oled.text("Dark",       66, 18, 1)
+    oled.text("----------", 66, 27, 1)
+    oled.text("Johto",      66, 36, 1)
+    oled.text("----------", 66, 45, 1)
+    oled.text("1.0m 27kg",  66, 55, 1)
+    oled.show()
+
+def play_umbreon(oled, rangeela):
+    for i in range(8):           rangeela[i] = (100, 0, 0)    # deep red / dark type
+    for i in range(8, NUM_LEDS): rangeela[i] = (50, 0, 0)
+    rangeela.write()
+    frames = load_frames("/sd/umbreon.bin")
+    if not frames: oled_message(oled, "Umbreon", "No frames!"); sleep(2); return None, None
+    gc.collect()
+    play_audio_with_animation(oled, frames, "/sd/umbreon.wav", umbreon_draw_frame)
+    return "umbreon", "Umbreon"
+
+def pikachu_draw_frame(oled, frame_bytes):
+    fb = framebuf.FrameBuffer(frame_bytes, FRAME_WIDTH, FRAME_HEIGHT, framebuf.MONO_HLSB)
+    oled.fill(0); oled.invert(False); oled.blit(fb, 0, 0)
+    oled.fill_rect(64, 0, 64, 64, 0)
+    oled.text("Pikachu",    66,  0, 1)
+    oled.text("----------", 66,  9, 1)
+    oled.text("Electric",   66, 18, 1)
+    oled.text("----------", 66, 27, 1)
+    oled.text("Kanto",      66, 36, 1)
+    oled.text("----------", 66, 45, 1)
+    oled.text("0.4m 6kg",   66, 55, 1)
+    oled.show()
+
+def play_pikachu(oled, rangeela):
+    for i in range(8):           rangeela[i] = (150, 150, 0)  # bright yellow
+    for i in range(8, NUM_LEDS): rangeela[i] = (80, 80, 0)
+    rangeela.write()
+    frames = load_frames("/sd/pikachu.bin")
+    if not frames: oled_message(oled, "Pikachu", "No frames!"); sleep(2); return None, None
+    gc.collect()
+    play_audio_with_animation(oled, frames, "/sd/pikachu.wav", pikachu_draw_frame)
+    return "pikachu", "Pikachu"
+
+def mudkip_draw_frame(oled, frame_bytes):
+    fb = framebuf.FrameBuffer(frame_bytes, FRAME_WIDTH, FRAME_HEIGHT, framebuf.MONO_HLSB)
+    oled.fill(0); oled.invert(False); oled.blit(fb, 0, 0)
+    oled.fill_rect(64, 0, 64, 64, 0)
+    oled.text("Mudkip",     66,  0, 1)
+    oled.text("----------", 66,  9, 1)
+    oled.text("Water",      66, 18, 1)
+    oled.text("----------", 66, 27, 1)
+    oled.text("Hoenn",      66, 36, 1)
+    oled.text("----------", 66, 45, 1)
+    oled.text("0.4m 7.6kg", 66, 55, 1)
+    oled.show()
+
+def play_mudkip(oled, rangeela):
+    for i in range(8):           rangeela[i] = (0, 0, 139)    # deep navy blue
+    for i in range(8, NUM_LEDS): rangeela[i] = (0, 0, 70)
+    rangeela.write()
+    frames = load_frames("/sd/mudkip.bin")
+    if not frames: oled_message(oled, "Mudkip", "No frames!"); sleep(2); return None, None
+    gc.collect()
+    play_audio_with_animation(oled, frames, "/sd/mudkip.wav", mudkip_draw_frame)
+    return "mudkip", "Mudkip"
+
+def mew_draw_frame(oled, frame_bytes):
+    fb = framebuf.FrameBuffer(frame_bytes, FRAME_WIDTH, FRAME_HEIGHT, framebuf.MONO_HLSB)
+    oled.fill(0); oled.invert(False); oled.blit(fb, 0, 0)
+    oled.fill_rect(64, 0, 64, 64, 0)
+    oled.text("Mew",        66,  0, 1)
+    oled.text("----------", 66,  9, 1)
+    oled.text("Psychic",    66, 18, 1)
+    oled.text("----------", 66, 27, 1)
+    oled.text("Kanto",      66, 36, 1)
+    oled.text("----------", 66, 45, 1)
+    oled.text("0.4m 4kg",   66, 55, 1)
+    oled.show()
+
+def play_mew(oled, rangeela):
+    for i in range(8):           rangeela[i] = (180, 100, 150)  # soft pink/psychic
+    for i in range(8, NUM_LEDS): rangeela[i] = (90, 50, 80)
+    rangeela.write()
+    frames = load_frames("/sd/mew.bin")
+    if not frames: oled_message(oled, "Mew", "No frames!"); sleep(2); return None, None
+    gc.collect()
+    play_audio_with_animation(oled, frames, "/sd/mew.wav", mew_draw_frame)
+    return "mew", "Mew"
+
+def jigglypuff_draw_frame(oled, frame_bytes):
+    fb = framebuf.FrameBuffer(frame_bytes, FRAME_WIDTH, FRAME_HEIGHT, framebuf.MONO_HLSB)
+    oled.fill(0); oled.invert(False); oled.blit(fb, 0, 0)
+    oled.fill_rect(64, 0, 64, 64, 0)
+    oled.text("Jigglypuf",  66,  0, 1)
+    oled.text("----------", 66,  9, 1)
+    oled.text("Normal",     66, 18, 1)
+    oled.text("Fairy",      66, 27, 1)
+    oled.text("Kanto",      66, 36, 1)
+    oled.text("----------", 66, 45, 1)
+    oled.text("0.5m 5.5kg", 66, 55, 1)
+    oled.show()
+
+def play_jigglypuff(oled, rangeela):
+    for i in range(4):    rangeela[i] = (255, 255, 255)  # white
+    for i in range(4, 8): rangeela[i] = (255, 20, 147)   # hot pink
+    rangeela.write()
+    frames = load_frames("/sd/jigglypuff.bin")
+    if not frames: oled_message(oled, "Jigglypuf", "No frames!"); sleep(2); return None, None
+    gc.collect()
+    play_audio_with_animation(oled, frames, "/sd/jigglypuff.wav", jigglypuff_draw_frame)
+    return "jigglypuff", "Jigglypuff"
+
+def gengar_draw_frame(oled, frame_bytes):
+    # Gengar uses an INVERTED display — white background, dark pixels.
+    # This matches Gengar's Ghost/Poison type and creates a visually distinct reveal.
+    fb = framebuf.FrameBuffer(frame_bytes, FRAME_WIDTH, FRAME_HEIGHT, framebuf.MONO_HLSB)
+    oled.fill(1); oled.invert(True); oled.blit(fb, 0, 0)
+    oled.text("Gengar",     78,  0, 0)
+    oled.text("----------", 70,  9, 0)
+    oled.text("Ghost",      78, 18, 0)
+    oled.text("Poison",     78, 27, 0)
+    oled.text("----------", 70, 36, 0)
+    oled.text("Kanto",      78, 45, 0)
+    oled.text("1.5m 41kg",  70, 55, 0)
+    oled.show()
+
+def play_gengar(oled, rangeela):
+    for i in range(4):    rangeela[i] = (75, 0, 180)    # deep purple
+    for i in range(4, 8): rangeela[i] = (250, 0, 250)   # magenta
+    rangeela.write()
+    frames = load_frames("/sd/gengar.bin")
+    if not frames: oled_message(oled, "Gengar", "No frames!"); sleep(2); return None, None
+    gc.collect()
+    play_audio_with_animation(oled, frames, "/sd/gengar.wav", gengar_draw_frame)
+    return "gengar", "Gengar"
+
+def spheal_draw_frame(oled, frame_bytes):
+    fb = framebuf.FrameBuffer(frame_bytes, FRAME_WIDTH, FRAME_HEIGHT, framebuf.MONO_HLSB)
+    oled.fill(0); oled.invert(False); oled.blit(fb, 0, 0)
+    oled.fill_rect(64, 0, 64, 64, 0)
+    oled.text("Spheal",     66,  0, 1)
+    oled.text("----------", 66,  9, 1)
+    oled.text("Ice",        66, 18, 1)
+    oled.text("Water",      66, 27, 1)
+    oled.text("Hoenn",      66, 36, 1)
+    oled.text("----------", 66, 45, 1)
+    oled.text("0.8m 39.5k", 66, 55, 1)
+    oled.show()
+
+def play_spheal(oled, rangeela):
+    for i in range(4):    rangeela[i] = (0, 150, 200)   # icy cyan
+    for i in range(4, 8): rangeela[i] = (0, 0, 250)     # deep blue
+    rangeela.write()
+    frames = load_frames("/sd/spheal.bin")
+    if not frames: oled_message(oled, "Spheal", "No frames!"); sleep(2); return None, None
+    gc.collect()
+    play_audio_with_animation(oled, frames, "/sd/spheal.wav", spheal_draw_frame)
+    return "spheal", "Spheal"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADC IDENTIFICATION TABLE
+# Maps averaged ADC voltage ranges to Pokémon.
+# Ranges are spaced ~50–80 units apart to prevent misidentification
+# even if the connector has slight resistance variation from wear.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def identify_and_play(adc_val, oled, rangeela):
+    if   50  <= adc_val <= 80:    return play_snivy(oled, rangeela)
+    elif 160 <= adc_val <= 190:   return play_vaporeon(oled, rangeela)
+    elif 210 <= adc_val <= 245:   return play_raichu(oled, rangeela)
+    elif 370 <= adc_val <= 420:   return play_umbreon(oled, rangeela)
+    elif 510 <= adc_val <= 550:   return play_pikachu(oled, rangeela)
+    elif 640 <= adc_val <= 690:   return play_mudkip(oled, rangeela)
+    elif 750 <= adc_val <= 800:   return play_mew(oled, rangeela)
+    elif 870 <= adc_val <= 910:   return play_jigglypuff(oled, rangeela)
+    elif 980 <= adc_val <= 1010:  return play_gengar(oled, rangeela)
+    elif 1080 <= adc_val <= 1110: return play_spheal(oled, rangeela)
+    else:
+        # No figure matched — show the raw ADC value to help debug connector issues
+        oled_message(oled, "Unknown", "ADC:" + str(adc_val), "Try again")
+        rangeela_clear(rangeela)
+        sleep(2)
+        return None, None
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN STATE MACHINE
+# The core loop: Boot → Standby → Scan → Reveal → Catch → Result → Reset
+# Runs forever until power is cut or POOPER long-press triggers a reboot.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    print("Pokedex standby - waiting for BOOT press")
+
+    # Initialise all hardware in sequence — order matters.
+    # SD card first so all other init functions can log errors to serial.
+    spi, sd            = init_sd()
+    rangeela           = init_neopixel()
+    i2c, oled          = init_oled()
+    adc                = init_adc()
+    pooper, butter     = init_buttons()
+    motor_ena, motor_in1, motor_in2 = init_motor()
+
+    # Wait for POOPER press before starting — device stays dark until user initiates
+    while pooper.value() == 1:
+        sleep_ms(50)
+    wait_for_button_release(pooper)
+
+    boot_animation(oled, rangeela)  # visual confirmation that boot is complete
+
+    while True:
+        # ── STANDBY ──
+        oled_message(oled, "POKEDEX", "Ready to Scan", "Press SCAN")
+        rangeela_clear(rangeela)
+
+        while True:
+            if check_long_press(pooper, LONG_PRESS_MS):
+                # 2-second hold on POOPER → reboot
+                oled_message(oled, "Rebooting...")
+                rangeela_clear(rangeela)
+                sleep(1)
+                reset()
+            if butter.value() == 0:
+                # BUTTER pressed → begin scan
+                sleep_ms(50)  # debounce
+                wait_for_button_release(butter)
+                break
+
+        # ── SCAN ──
+        oled_message(oled, "Scanning...")
+        scan_animation(rangeela)
+        adc_val = read_adc_average(adc)
+        print("ADC avg:", adc_val)
+        oled_message(oled, "Scanning...", "ADC:" + str(adc_val))
+        sleep_ms(500)  # brief pause so the user can read the ADC value on screen
+
+        # ── IDENTIFY & REVEAL ──
+        rangeela_clear(rangeela)
+        pokemon_key, pokemon_name = identify_and_play(adc_val, oled, rangeela)
+
+        # ── CATCH ──
+        if pokemon_key is not None:
+            rangeela_clear(rangeela)
+            sleep_ms(300)
+            try_catch(oled, rangeela, butter,
+                      motor_ena, motor_in1, motor_in2,
+                      pokemon_key, pokemon_name)
+
+        # ── RESET ──
+        rangeela_clear(rangeela)
+        oled_message(oled, "Restarting...", "", "")
+        sleep(2)
+        gc.collect()  # free memory from frames and audio buffers before next round
+
+# Wrap main() in try/except so any fatal crash prints the error
+# instead of silently hanging — makes debugging much easier.
+try:
+    main()
+except Exception as e:
+    print("FATAL:", e)
